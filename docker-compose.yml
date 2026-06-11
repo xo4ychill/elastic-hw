@@ -1,0 +1,125 @@
+networks:
+  elastic:
+    driver: bridge
+
+volumes:
+  elasticsearch-hot-data:
+  elasticsearch-warm-data:
+
+services:
+
+  # === Elasticsearch HOT нода ===
+  elasticsearch-hot:
+    image: elasticsearch:8.7.1
+    container_name: elasticsearch-hot
+    environment:
+      - node.name=elasticsearch-hot
+      - cluster.name=es-cluster
+      - discovery.seed_hosts=elasticsearch-warm
+      - cluster.initial_master_nodes=elasticsearch-hot,elasticsearch-warm
+      - node.roles=master,data_hot,data_content
+      - bootstrap.memory_lock=true
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - xpack.security.enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-hot-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - elastic
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # === Elasticsearch WARM нода ===
+  elasticsearch-warm:
+    image: elasticsearch:8.7.1
+    container_name: elasticsearch-warm
+    environment:
+      - node.name=elasticsearch-warm
+      - node.roles=master,data_warm
+      - cluster.name=es-cluster
+      - discovery.seed_hosts=elasticsearch-hot
+      - cluster.initial_master_nodes=elasticsearch-hot,elasticsearch-warm
+      - bootstrap.memory_lock=true
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - xpack.security.enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-warm-data:/usr/share/elasticsearch/data
+    networks:
+      - elastic
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # === Logstash ===
+  logstash:
+    image: logstash:8.7.1
+    container_name: logstash
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    ports:
+      - "5044:5044"   # Beats input
+      - "5001:5001/tcp"  # TCP JSON input
+    environment:
+      - LS_JAVA_OPTS=-Xms256m -Xmx256m
+    networks:
+      - elastic
+    depends_on:
+      elasticsearch-hot:
+        condition: service_healthy
+
+  # === Kibana ===
+  kibana:
+    image: kibana:8.7.1
+    container_name: kibana
+    restart: unless-stopped
+    volumes:
+      - ./kibana/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    ports:
+      - "5601:5601"
+    networks:
+      - elastic
+    depends_on:
+      elasticsearch-hot:
+        condition: service_healthy
+
+  # === Filebeat ===
+  filebeat:
+    image: elastic/filebeat:8.7.1
+    container_name: filebeat
+    user: root
+    command: filebeat -e --strict.perms=false
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - elastic
+    depends_on:
+      - logstash
+
+  # === Dummy-приложение (генерирует случайные логи) ===
+  some_application:
+    image: alpine
+    container_name: some_application
+    command: >
+      sh -c "while true; do
+        echo \"{\\\"level\\\": \\\"INFO\\\", \\\"message\\\": \\\"Event $(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 8)\\\", \\\"timestamp\\\": \\\"$(date -Iseconds)\\\"}\";
+        sleep 2;
+      done"
+    networks:
+      - elastic
